@@ -53,6 +53,8 @@ class GameConsumer(AsyncWebsocketConsumer):
                         },
                     )
 
+            await self.remove_player()
+
         await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
 
     # --- Méthode principale de réception des messages ---
@@ -250,3 +252,12 @@ class GameConsumer(AsyncWebsocketConsumer):
             "word1": {"word": "exemple1", "clues": 3},
             "word2": {"word": "exemple2", "clues": 4},
         }
+
+    @database_sync_to_async
+    def remove_player(self):
+        Player = apps.get_model("game", "Player")
+        try:
+            player = Player.objects.get(id=self.player_id)
+            player.delete()
+        except Player.DoesNotExist:
+            pass
