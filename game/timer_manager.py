@@ -37,7 +37,6 @@ class RoomTimerManager:
         try:
             for t in range(duration, 0, -1):
                 if timer_id != self.current_timer_id:
-                    print(f"Timer {timer_id} abandonné")
                     return
 
                 await asyncio.sleep(1)
@@ -50,6 +49,16 @@ class RoomTimerManager:
                         "currentPlayer": current_player,
                     },
                 )
+
+            # Timer terminé
+            await channel_layer.group_send(
+                self.room_group_name,
+                {
+                    "type": "timer_end",
+                    "phase": phase,
+                    "currentPlayer": current_player,
+                },
+            )
         except asyncio.CancelledError:
             print(f"Timer {timer_id} cancelled")
             return

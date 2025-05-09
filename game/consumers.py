@@ -85,6 +85,10 @@ class GameConsumer(AsyncWebsocketConsumer):
             await self.handle_make_guess(data)
         elif msg_type == "join_game":
             await self.handle_join_game()
+        elif msg_type == "timer_end":
+            phase = data.get("phase")
+            if phase:
+                await self.handle_timer_end(phase)
 
     # --- Méthodes de traitement des messages ---
     async def handle_init(self, data):
@@ -159,6 +163,8 @@ class GameConsumer(AsyncWebsocketConsumer):
                 "given_clues": [],
                 "required_clues": None,
                 "current_word": "",
+                "guessing_players": [],  # Liste des joueurs ayant déjà deviné
+                "word_found": False,  # Pour savoir si le mot a été trouvé
             }
         )
         await self.set_current_word_choices(words)
@@ -209,15 +215,20 @@ class GameConsumer(AsyncWebsocketConsumer):
         if not clue:
             return
 
-        # Vérifier si le clue n'a pas déjà été utilisé
         game_state = await self.get_game_state()
+
+        # Vérifie si le clue n'a pas déjà été utilisé
         if clue.lower() in [c.lower() for c in game_state.get("given_clues", [])]:
             return
 
-        # Ajouter l'indice à la liste
+        # Ajoute l'indice et met à jour l'état
         await self.add_clue(clue)
+        game_state["phase"] = "guess"
+        # Réinitialise la liste des joueurs ayant deviné pour ce nouvel indice
+        game_state["guessing_players"] = []
+        await self.set_game_state(game_state)
 
-        # Informer tous les joueurs du nouvel indice
+        # Informe les joueurs
         await self.channel_layer.group_send(
             self.room_group_name,
             {
@@ -227,12 +238,8 @@ class GameConsumer(AsyncWebsocketConsumer):
             },
         )
 
-        # Vérifier si tous les indices requis ont été donnés
-        if len(game_state.get("given_clues", [])) + 1 >= game_state.get(
-            "required_clues", 0
-        ):
-            # Passer au joueur suivant si personne n'a trouvé
-            await self.end_turn()
+        # Démarre immédiatement la phase de guess
+        await self.switch_timer(60, "guess", game_state["current_player"])
 
     async def handle_make_guess(self, data):
         guess = data.get("guess")
@@ -240,9 +247,16 @@ class GameConsumer(AsyncWebsocketConsumer):
             return
 
         game_state = await self.get_game_state()
-        current_word = game_state.get("current_word", "").lower()
 
-        # Informer tous les joueurs de la tentative
+        # Vérifie si le joueur n'a pas déjà deviné
+        if self.player_id in game_state.get("guessing_players", []):
+            return
+
+        # Ajoute le joueur à la liste des joueurs ayant deviné
+        game_state["guessing_players"].append(self.player_id)
+        await self.set_game_state(game_state)
+
+        # Informe de la tentative
         await self.channel_layer.group_send(
             self.room_group_name,
             {
@@ -252,24 +266,43 @@ class GameConsumer(AsyncWebsocketConsumer):
             },
         )
 
-        # Si le mot est correct
+        current_word = game_state.get("current_word", "").lower()
         if guess.lower() == current_word:
-            # Calculer les points
+            # Le mot est trouvé
             clues_used = len(game_state.get("given_clues", []))
             required_clues = game_state.get("required_clues", 0)
 
+            # Attribution des points
             points = clues_used
-            if clues_used <= required_clues:
-                # Mettre à jour les scores
-                await self.update_score(
-                    self.player_id, points
-                )  # Points pour celui qui devine
+            await self.update_score(
+                self.player_id, points
+            )  # Points pour celui qui devine
+
+            if clues_used == required_clues:
                 await self.update_score(
                     game_state["current_player"], points
-                )  # Points pour celui qui fait deviner
+                )  # Le joueur qui donne l'indice ne gagne des points que si le mot est trouvé avec le nombre d'indices requis
 
             # Fin du tour
             await self.end_turn()
+        else:
+            # Vérifie si tous les joueurs ont deviné
+            all_players = await self.get_room_players()
+            non_current_players = [
+                p["id"] for p in all_players if p["id"] != game_state["current_player"]
+            ]
+
+            if len(game_state["guessing_players"]) >= len(non_current_players):
+                # Tous les joueurs ont deviné, on passe à la phase suivante
+                if len(game_state["given_clues"]) >= game_state["required_clues"]:
+                    # Plus d'indices possibles, fin du tour
+                    await self.end_turn()
+                else:
+                    # Retour à la phase d'indice
+                    game_state["phase"] = "clue"
+                    game_state["guessing_players"] = []  # Réinitialise la liste
+                    await self.set_game_state(game_state)
+                    await self.switch_timer(60, "clue", game_state["current_player"])
 
     async def handle_join_game(self):
         room = await self.get_room()
@@ -284,6 +317,29 @@ class GameConsumer(AsyncWebsocketConsumer):
                     }
                 )
             )
+
+    async def handle_timer_end(self, phase):
+        game_state = await self.get_game_state()
+
+        if phase == "choice":
+            # Le joueur n'a pas choisi de mot, il perd des points
+            await self.end_turn()
+        elif phase == "clue":
+            # Le joueur n'a pas donné d'indice, il perd des points
+            points_to_lose = game_state.get("required_clues", 0)
+            await self.update_score(game_state["current_player"], -points_to_lose)
+            await self.end_turn()
+        elif phase == "guess":
+            # Phase de devinette terminée
+            if len(game_state["given_clues"]) >= game_state["required_clues"]:
+                # Plus d'indices possibles, fin du tour
+                await self.end_turn()
+            else:
+                # Retour à la phase d'indice
+                game_state["phase"] = "clue"
+                game_state["guessing_players"] = []
+                await self.set_game_state(game_state)
+                await self.switch_timer(60, "clue", game_state["current_player"])
 
     # --- Méthodes d'accès à la base de données ---
     @database_sync_to_async
@@ -450,6 +506,31 @@ class GameConsumer(AsyncWebsocketConsumer):
             text_data=json.dumps({"type": "owner_changed", "player": event["player"]})
         )
 
+    async def word_selected(self, event):
+        await self.send(text_data=json.dumps(event))
+
+    async def clue_given(self, event):
+        await self.send(text_data=json.dumps(event))
+
+    async def guess_made(self, event):
+        await self.send(text_data=json.dumps(event))
+
+    async def timer_update(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "timer_update",
+                    "timeLeft": event["timeLeft"],
+                    "phase": event["phase"],
+                    "currentPlayer": event["currentPlayer"],
+                }
+            )
+        )
+
+    # === Méthodes utilitaires ===
+    async def switch_timer(self, duration, phase, current_player):
+        await self.timer_manager.switch_timer(duration, phase, current_player)
+
     async def end_turn(self):
         # Choisir le prochain joueur
         players = await self.get_room_players()
@@ -475,27 +556,3 @@ class GameConsumer(AsyncWebsocketConsumer):
                 "wordChoices": new_words,
             },
         )
-
-    async def word_selected(self, event):
-        await self.send(text_data=json.dumps(event))
-
-    async def clue_given(self, event):
-        await self.send(text_data=json.dumps(event))
-
-    async def guess_made(self, event):
-        await self.send(text_data=json.dumps(event))
-
-    async def timer_update(self, event):
-        await self.send(
-            text_data=json.dumps(
-                {
-                    "type": "timer_update",
-                    "timeLeft": event["timeLeft"],
-                    "phase": event["phase"],
-                    "currentPlayer": event["currentPlayer"],
-                }
-            )
-        )
-
-    async def switch_timer(self, duration, phase, current_player):
-        await self.timer_manager.switch_timer(duration, phase, current_player)
