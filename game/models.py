@@ -1,10 +1,13 @@
 import uuid
+import jsonfield
 from django.db import models
 
 
 class GameRoom(models.Model):
     code = models.CharField(max_length=6, unique=True)  # ex: ABCD12
     created_at = models.DateTimeField(auto_now_add=True)
+    current_word_choices = jsonfield.JSONField(null=True)
+    game_state = jsonfield.JSONField(null=True)
     current_turn = models.IntegerField(default=0)
     is_active = models.BooleanField(default=True)
 
