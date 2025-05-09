@@ -1,23 +1,23 @@
 import json
 from math import e
 import random
-import asyncio
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 from django.apps import apps
+from .timer_manager import RoomTimerManager
 
 
 class GameConsumer(AsyncWebsocketConsumer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.timer_task = None
-        self.current_timer_id = 0  # Pour suivre les timers actifs
+        self.timer_manager = None
 
     # --- Méthodes de connexion/déconnexion ---
     async def connect(self):
         self.room_code = self.scope["url_route"]["kwargs"]["room_code"]
         self.room_group_name = f"game_{self.room_code}"
+        self.timer_manager = RoomTimerManager.get_instance(self.room_code)
 
         room = await self.get_room()
         if not room:
@@ -485,28 +485,6 @@ class GameConsumer(AsyncWebsocketConsumer):
     async def guess_made(self, event):
         await self.send(text_data=json.dumps(event))
 
-    async def run_timer(self, duration, phase, current_player, timer_id):
-        try:
-            for t in range(duration, 0, -1):
-                # Vérifie si ce timer est toujours le timer actif
-                if timer_id != self.current_timer_id:
-                    print(f"Timer {timer_id} abandonné")
-                    return
-
-                await asyncio.sleep(1)
-                await self.channel_layer.group_send(
-                    self.room_group_name,
-                    {
-                        "type": "timer_update",
-                        "timeLeft": t,
-                        "phase": phase,
-                        "currentPlayer": current_player,
-                    },
-                )
-        except asyncio.CancelledError:
-            print(f"Timer {timer_id} cancelled")
-            return
-
     async def timer_update(self, event):
         await self.send(
             text_data=json.dumps(
@@ -520,26 +498,4 @@ class GameConsumer(AsyncWebsocketConsumer):
         )
 
     async def switch_timer(self, duration, phase, current_player):
-        # Incrémente l'ID du timer pour abandonner l'ancien
-        self.current_timer_id += 1
-        current_id = self.current_timer_id
-
-        # Annule l'ancien timer
-        if self.timer_task and not self.timer_task.done():
-            self.timer_task.cancel()
-            try:
-                await self.timer_task
-            except asyncio.CancelledError:
-                pass
-
-        # Attend un court instant
-        await asyncio.sleep(0.1)
-
-        # Vérifie si un autre timer n'a pas été démarré entre temps
-        if current_id != self.current_timer_id:
-            return
-
-        # Démarre le nouveau timer
-        self.timer_task = asyncio.create_task(
-            self.run_timer(duration, phase, current_player, current_id)
-        )
+        await self.timer_manager.switch_timer(duration, phase, current_player)
