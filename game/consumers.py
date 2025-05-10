@@ -92,6 +92,8 @@ class GameConsumer(AsyncWebsocketConsumer):
             phase = data.get("phase")
             if phase:
                 await self.handle_timer_end(phase)
+        elif msg_type == "start_new_round":
+            await self.end_turn()
 
     # --- Méthodes de traitement des messages ---
     async def handle_init(self, data):
@@ -276,8 +278,11 @@ class GameConsumer(AsyncWebsocketConsumer):
             # Attribution des points
             points = clues_used
             await self.update_score(self.player_id, points)
-            print(round_info)
-            if len(round_info["given_clues"]) == round_info["required_clues"]:
+            perfect_guess = (
+                len(round_info["given_clues"]) == round_info["required_clues"]
+            )
+
+            if perfect_guess:
                 await self.update_score(round_info["current_player"]["id"], points)
 
             # Marque le round comme terminé
@@ -285,11 +290,27 @@ class GameConsumer(AsyncWebsocketConsumer):
                 word_found=True, winner_id=self.player_id
             )
 
-            # Arrêter le timer avant de finir le tour
+            # Récupérer les scores mis à jour
+            updated_players = await self.get_room_players()
+
+            # Envoyer le message de fin de round
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {
+                    "type": "round_complete",
+                    "winner": {"id": self.player_id, "pseudo": self.pseudo},
+                    "cluesCount": clues_used,
+                    "requiredClues": round_info["required_clues"],
+                    "word": round_info["word"],
+                    "currentPlayer": round_info["current_player"],
+                    "perfect": perfect_guess,
+                    "players": updated_players,
+                },
+            )
+
+            # Arrêter le timer
             await self.timer_manager.cancel_timer()
 
-            # Fin du tour
-            await self.end_turn()
         else:
             # Vérifie si tous les joueurs ont deviné
             all_players = await self.get_room_players()
@@ -544,6 +565,10 @@ class GameConsumer(AsyncWebsocketConsumer):
                 }
             )
         )
+
+    async def round_complete(self, event):
+        """Gestionnaire pour l'événement round_complete"""
+        await self.send(text_data=json.dumps(event))
 
     # === Méthodes utilitaires ===
     async def switch_timer(self, duration, phase, current_player):
