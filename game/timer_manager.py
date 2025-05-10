@@ -62,3 +62,13 @@ class RoomTimerManager:
         except asyncio.CancelledError:
             print(f"Timer {timer_id} cancelled")
             return
+
+    async def cancel_timer(self):
+        """Annule le timer en cours s'il existe"""
+        if self.timer_task and not self.timer_task.done():
+            self.timer_task.cancel()
+            try:
+                await self.timer_task
+            except asyncio.CancelledError:
+                pass
+            self.timer_task = None

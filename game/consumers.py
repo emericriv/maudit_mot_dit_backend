@@ -4,6 +4,8 @@ import random
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 from django.apps import apps
+
+from .round_manager import RoundManager
 from .timer_manager import RoomTimerManager
 
 
@@ -18,6 +20,7 @@ class GameConsumer(AsyncWebsocketConsumer):
         self.room_code = self.scope["url_route"]["kwargs"]["room_code"]
         self.room_group_name = f"game_{self.room_code}"
         self.timer_manager = RoomTimerManager.get_instance(self.room_code)
+        self.round_manager = RoundManager(self.room_code)
 
         room = await self.get_room()
         if not room:
@@ -151,24 +154,14 @@ class GameConsumer(AsyncWebsocketConsumer):
 
         players = await self.get_room_players()
         first_player = random.choice(players)["id"]
-
         words = await self.generate_word_choices()
 
-        # Stocke l'état du jeu dans la room
-        await self.set_game_state(
-            {
-                "current_player": first_player,
-                "time_left": 30,
-                "phase": "choice",
-                "given_clues": [],
-                "required_clues": None,
-                "current_word": "",
-                "guessing_players": [],  # Liste des joueurs ayant déjà deviné
-                "word_found": False,  # Pour savoir si le mot a été trouvé
-            }
-        )
+        # Crée un nouveau round
+        await self.round_manager.start_new_round(first_player)
+        # Stocke les choix de mots dans la room
         await self.set_current_word_choices(words)
 
+        # Informe les joueurs
         await self.channel_layer.group_send(
             self.room_group_name,
             {
@@ -190,14 +183,12 @@ class GameConsumer(AsyncWebsocketConsumer):
         if not word_choice:
             return
 
-        # Met à jour le game_state avec le mot choisi, la phase et le nombre d'indices requis
-        game_state = await self.get_game_state()
-        game_state["phase"] = "clue"
-        game_state["current_word"] = word
-        game_state["required_clues"] = word_choice["clues"]
-        await self.set_game_state(game_state)
+        # Met à jour le round avec le mot choisi
+        await self.round_manager.update_phase(
+            "clue", word=word, required_clues=word_choice["clues"]
+        )
 
-        # Informer tous les joueurs que le mot a été choisi
+        # Informe les joueurs
         await self.channel_layer.group_send(
             self.room_group_name,
             {
@@ -207,26 +198,36 @@ class GameConsumer(AsyncWebsocketConsumer):
             },
         )
 
-        # Change le timer pour la nouvelle phase
-        await self.switch_timer(60, "clue", game_state["current_player"])
+        await self.switch_timer(60, "clue", self.player_id)
 
     async def handle_give_clue(self, data):
         clue = data.get("clue")
         if not clue:
             return
 
-        game_state = await self.get_game_state()
+        round = await self.round_manager.get_current_round()
 
-        # Vérifie si le clue n'a pas déjà été utilisé
-        if clue.lower() in [c.lower() for c in game_state.get("given_clues", [])]:
+        # Vérifie si le clue n'a pas déjà été utilisé comme indice ou comme guess
+        if clue.lower() in [c.lower() for c in round.given_clues]:
+            await self.send(
+                json.dumps({"type": "error", "message": "Cet indice a déjà été donné"})
+            )
             return
 
-        # Ajoute l'indice et met à jour l'état
-        await self.add_clue(clue)
-        game_state["phase"] = "guess"
-        # Réinitialise la liste des joueurs ayant deviné pour ce nouvel indice
-        game_state["guessing_players"] = []
-        await self.set_game_state(game_state)
+        if any(guess["word"].lower() == clue.lower() for guess in round.given_guesses):
+            await self.send(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": "Ce mot a déjà été proposé comme réponse, il ne peut pas être utilisé comme indice",
+                    }
+                )
+            )
+            return
+
+        # Ajoute l'indice et met à jour la phase
+        await self.round_manager.add_clue(clue)
+        await self.round_manager.update_phase("guess")
 
         # Informe les joueurs
         await self.channel_layer.group_send(
@@ -238,50 +239,54 @@ class GameConsumer(AsyncWebsocketConsumer):
             },
         )
 
-        # Démarre immédiatement la phase de guess
-        await self.switch_timer(60, "guess", game_state["current_player"])
+        await self.switch_timer(60, "guess", self.player_id)
 
     async def handle_make_guess(self, data):
         guess = data.get("guess")
         if not guess:
             return
 
-        game_state = await self.get_game_state()
-
-        # Vérifie si le joueur n'a pas déjà deviné
-        if self.player_id in game_state.get("guessing_players", []):
+        # Récupère les informations du round de manière asynchrone
+        round_info = await self.round_manager.get_current_round_with_player()
+        if not round_info or self.player_id in round_info["guessing_players"]:
             return
 
-        # Ajoute le joueur à la liste des joueurs ayant deviné
-        game_state["guessing_players"].append(self.player_id)
-        await self.set_game_state(game_state)
+        # Ajoute la tentative et met à jour les joueurs ayant deviné
+        given_guesses, guessing_players, timestamp = await self.round_manager.add_guess(
+            self.player_id, guess
+        )
 
-        # Informe de la tentative
+        # Informe tous les joueurs de la tentative
         await self.channel_layer.group_send(
             self.room_group_name,
             {
                 "type": "guess_made",
                 "playerId": self.player_id,
                 "guess": guess,
+                "timestamp": timestamp,
+                "allGuesses": given_guesses,
             },
         )
 
-        current_word = game_state.get("current_word", "").lower()
-        if guess.lower() == current_word:
+        # Vérifie si c'est le bon mot
+        if guess.lower() == round_info["word"].lower():
             # Le mot est trouvé
-            clues_used = len(game_state.get("given_clues", []))
-            required_clues = game_state.get("required_clues", 0)
+            clues_used = len(round_info["given_clues"])
 
             # Attribution des points
             points = clues_used
-            await self.update_score(
-                self.player_id, points
-            )  # Points pour celui qui devine
+            await self.update_score(self.player_id, points)
+            print(round_info)
+            if len(round_info["given_clues"]) == round_info["required_clues"]:
+                await self.update_score(round_info["current_player"]["id"], points)
 
-            if clues_used == required_clues:
-                await self.update_score(
-                    game_state["current_player"], points
-                )  # Le joueur qui donne l'indice ne gagne des points que si le mot est trouvé avec le nombre d'indices requis
+            # Marque le round comme terminé
+            await self.round_manager.complete_round(
+                word_found=True, winner_id=self.player_id
+            )
+
+            # Arrêter le timer avant de finir le tour
+            await self.timer_manager.cancel_timer()
 
             # Fin du tour
             await self.end_turn()
@@ -289,57 +294,59 @@ class GameConsumer(AsyncWebsocketConsumer):
             # Vérifie si tous les joueurs ont deviné
             all_players = await self.get_room_players()
             non_current_players = [
-                p["id"] for p in all_players if p["id"] != game_state["current_player"]
+                p["id"]
+                for p in all_players
+                if p["id"] != round_info["current_player"]["id"]
             ]
 
-            if len(game_state["guessing_players"]) >= len(non_current_players):
-                # Tous les joueurs ont deviné, on passe à la phase suivante
-                if len(game_state["given_clues"]) >= game_state["required_clues"]:
-                    # Plus d'indices possibles, fin du tour
+            if len(guessing_players) >= len(non_current_players):
+                if len(round_info["given_clues"]) >= round_info["required_clues"]:
                     await self.end_turn()
                 else:
-                    # Retour à la phase d'indice
-                    game_state["phase"] = "clue"
-                    game_state["guessing_players"] = []  # Réinitialise la liste
-                    await self.set_game_state(game_state)
-                    await self.switch_timer(60, "clue", game_state["current_player"])
+                    await self.round_manager.update_phase("clue")
+                    await self.switch_timer(
+                        60, "clue", round_info["current_player"]["id"]
+                    )
 
     async def handle_join_game(self):
-        room = await self.get_room()
-        if hasattr(room, "game_state") and room.game_state:
+        round_data = await self.round_manager.get_current_round_with_player()
+
+        if round_data:
+            # Récupère les choix de mots actuels
+            word_choices = await self.get_current_word_choices()
+
+            # Envoie l'état actuel du jeu au joueur qui rejoint
             await self.send(
                 text_data=json.dumps(
                     {
                         "type": "game_started",
-                        "currentPlayer": room.game_state.get("current_player"),
-                        "wordChoices": room.current_word_choices,
-                        "timeLeft": room.game_state.get("time_left", 30),
+                        "currentPlayer": round_data["current_player"]["id"],
+                        "wordChoices": word_choices,
+                        "timeLeft": 30,  # ou récupérer depuis le timer manager
+                        "phase": round_data["phase"],
+                        "givenClues": round_data["given_clues"],
+                        "guesses": round_data["given_guesses"],
+                        "requiredClues": round_data["required_clues"],
                     }
                 )
             )
 
     async def handle_timer_end(self, phase):
-        game_state = await self.get_game_state()
+        round = await self.round_manager.get_current_round()
 
         if phase == "choice":
-            # Le joueur n'a pas choisi de mot, il perd des points
+            # Le joueur n'a pas choisi de mot
             await self.end_turn()
         elif phase == "clue":
-            # Le joueur n'a pas donné d'indice, il perd des points
-            points_to_lose = game_state.get("required_clues", 0)
-            await self.update_score(game_state["current_player"], -points_to_lose)
+            # Le joueur n'a pas donné d'indice
+            await self.update_score(round.current_player.id, -round.required_clues)
             await self.end_turn()
         elif phase == "guess":
-            # Phase de devinette terminée
-            if len(game_state["given_clues"]) >= game_state["required_clues"]:
-                # Plus d'indices possibles, fin du tour
+            if len(round.given_clues) >= round.required_clues:
                 await self.end_turn()
             else:
-                # Retour à la phase d'indice
-                game_state["phase"] = "clue"
-                game_state["guessing_players"] = []
-                await self.set_game_state(game_state)
-                await self.switch_timer(60, "clue", game_state["current_player"])
+                await self.round_manager.update_phase("clue")
+                await self.switch_timer(60, "clue", round.current_player.id)
 
     # --- Méthodes d'accès à la base de données ---
     @database_sync_to_async
@@ -363,7 +370,12 @@ class GameConsumer(AsyncWebsocketConsumer):
         GameRoom = apps.get_model("game", "GameRoom")
         room = GameRoom.objects.get(code=self.room_code)
         return [
-            {"id": str(player.id), "pseudo": player.pseudo, "is_owner": player.is_owner}
+            {
+                "id": str(player.id),
+                "pseudo": player.pseudo,
+                "is_owner": player.is_owner,
+                "score": player.score,
+            }
             for player in room.players.all()
         ]
 
@@ -405,21 +417,6 @@ class GameConsumer(AsyncWebsocketConsumer):
         return None
 
     @database_sync_to_async
-    def get_game_state(self):
-        GameRoom = apps.get_model("game", "GameRoom")
-        room = GameRoom.objects.get(code=self.room_code)
-        return room.game_state
-
-    @database_sync_to_async
-    def add_clue(self, clue):
-        GameRoom = apps.get_model("game", "GameRoom")
-        room = GameRoom.objects.get(code=self.room_code)
-        game_state = room.game_state or {}
-        game_state["given_clues"] = game_state.get("given_clues", []) + [clue]
-        room.game_state = game_state
-        room.save()
-
-    @database_sync_to_async
     def update_score(self, player_id, points):
         Player = apps.get_model("game", "Player")
         player = Player.objects.get(id=player_id)
@@ -443,18 +440,20 @@ class GameConsumer(AsyncWebsocketConsumer):
             pass
 
     @database_sync_to_async
-    def set_game_state(self, state):
-        GameRoom = apps.get_model("game", "GameRoom")
-        room = GameRoom.objects.get(code=self.room_code)
-        room.game_state = state
-        room.save()
-
-    @database_sync_to_async
     def set_current_word_choices(self, word_choices):
         GameRoom = apps.get_model("game", "GameRoom")
         room = GameRoom.objects.get(code=self.room_code)
         room.current_word_choices = word_choices
         room.save()
+
+    @database_sync_to_async
+    def get_current_word_choices(self):
+        GameRoom = apps.get_model("game", "GameRoom")
+        try:
+            room = GameRoom.objects.get(code=self.room_code)
+            return room.current_word_choices
+        except GameRoom.DoesNotExist:
+            return None
 
     # --- Gestionnaires d'événements ---
     async def game_message(self, event):
@@ -527,18 +526,40 @@ class GameConsumer(AsyncWebsocketConsumer):
             )
         )
 
+    async def timer_end(self, event):
+        """Gestionnaire pour l'événement timer_end"""
+        await self.send(
+            text_data=json.dumps({"type": "timer_end", "phase": event["phase"]})
+        )
+
+    async def turn_end(self, event):
+        """Gestionnaire pour l'événement turn_end"""
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "turn_end",
+                    "nextPlayer": event["nextPlayer"],
+                    "wordChoices": event["wordChoices"],
+                    "players": event["players"],
+                }
+            )
+        )
+
     # === Méthodes utilitaires ===
     async def switch_timer(self, duration, phase, current_player):
         await self.timer_manager.switch_timer(duration, phase, current_player)
 
     async def end_turn(self):
+        # Récupérer le round actuel avec les infos joueur
+        round_info = await self.round_manager.get_current_round_with_player()
+
         # Choisir le prochain joueur
         players = await self.get_room_players()
         current_player_index = next(
             (
                 i
                 for i, p in enumerate(players)
-                if p["id"] == await self.get_current_player()
+                if p["id"] == round_info["current_player"]["id"]
             ),
             0,
         )
@@ -547,6 +568,15 @@ class GameConsumer(AsyncWebsocketConsumer):
         # Générer de nouveaux mots pour le prochain tour
         new_words = await self.generate_word_choices()
 
+        # Stocker les nouveaux choix de mots
+        await self.set_current_word_choices(new_words)
+
+        # Créer un nouveau round pour le prochain joueur
+        await self.round_manager.start_new_round(next_player)
+
+        # Récupérer les scores mis à jour
+        updated_players = await self.get_room_players()
+
         # Informer tous les joueurs de la fin du tour
         await self.channel_layer.group_send(
             self.room_group_name,
@@ -554,5 +584,6 @@ class GameConsumer(AsyncWebsocketConsumer):
                 "type": "turn_end",
                 "nextPlayer": next_player,
                 "wordChoices": new_words,
+                "players": updated_players,
             },
         )
