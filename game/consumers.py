@@ -94,7 +94,7 @@ class GameConsumer(AsyncWebsocketConsumer):
             if phase:
                 await self.handle_timer_end(phase)
         elif msg_type == "start_new_round":
-            await self.end_turn()
+            await self.start_new_round()
 
     # --- Méthodes de traitement des messages ---
     async def handle_init(self, data):
@@ -323,7 +323,33 @@ class GameConsumer(AsyncWebsocketConsumer):
 
             if len(guessing_players) >= len(non_current_players):
                 if len(round_info["given_clues"]) >= round_info["required_clues"]:
-                    await self.end_turn()
+                    # Récupérer les informations nécessaires
+                    round_info = (
+                        await self.round_manager.get_current_round_with_player()
+                    )
+
+                    # Marquer le round comme terminé
+                    await self.round_manager.complete_round(word_found=False)
+
+                    # Récupérer les scores mis à jour
+                    updated_players = await self.get_room_players()
+
+                    # Informer tous les joueurs que le round est terminé sans gagnant
+                    await self.channel_layer.group_send(
+                        self.room_group_name,
+                        {
+                            "type": "round_complete",
+                            "winner": None,
+                            "word": round_info["word"],
+                            "cluesCount": len(round_info["given_clues"]),
+                            "requiredClues": round_info["required_clues"],
+                            "currentPlayer": round_info["current_player"],
+                            "perfect": False,
+                            "players": updated_players,
+                        },
+                    )
+
+                    await self.timer_manager.cancel_timer()
                 else:
                     await self.round_manager.update_phase("clue")
                     await self.switch_timer(
@@ -358,14 +384,38 @@ class GameConsumer(AsyncWebsocketConsumer):
 
         if phase == "choice":
             # Le joueur n'a pas choisi de mot
-            await self.end_turn()
+            await self.start_new_round()
         elif phase == "clue":
             # Le joueur n'a pas donné d'indice
             await self.update_score(round.current_player.id, -round.required_clues)
-            await self.end_turn()
+            await self.start_new_round()
         elif phase == "guess":
             if len(round.given_clues) >= round.required_clues:
-                await self.end_turn()
+                # Récupérer les informations nécessaires
+                round_info = await self.round_manager.get_current_round_with_player()
+
+                # Marquer le round comme terminé
+                await self.round_manager.complete_round(word_found=False)
+
+                # Récupérer les scores mis à jour
+                updated_players = await self.get_room_players()
+
+                # Informer tous les joueurs que le round est terminé sans gagnant
+                await self.channel_layer.group_send(
+                    self.room_group_name,
+                    {
+                        "type": "round_complete",
+                        "winner": None,
+                        "word": round_info["word"],
+                        "cluesCount": len(round_info["given_clues"]),
+                        "requiredClues": round_info["required_clues"],
+                        "currentPlayer": round_info["current_player"],
+                        "perfect": False,
+                        "players": updated_players,
+                    },
+                )
+
+                await self.timer_manager.cancel_timer()
             else:
                 await self.round_manager.update_phase("clue")
                 await self.switch_timer(60, "clue", round.current_player.id)
@@ -565,12 +615,12 @@ class GameConsumer(AsyncWebsocketConsumer):
             text_data=json.dumps({"type": "timer_end", "phase": event["phase"]})
         )
 
-    async def turn_end(self, event):
-        """Gestionnaire pour l'événement turn_end"""
+    async def new_round(self, event):
+        """Gestionnaire pour l'événement new_round"""
         await self.send(
             text_data=json.dumps(
                 {
-                    "type": "turn_end",
+                    "type": "new_round",
                     "nextPlayer": event["nextPlayer"],
                     "wordChoices": event["wordChoices"],
                     "players": event["players"],
@@ -586,7 +636,7 @@ class GameConsumer(AsyncWebsocketConsumer):
     async def switch_timer(self, duration, phase, current_player):
         await self.timer_manager.switch_timer(duration, phase, current_player)
 
-    async def end_turn(self):
+    async def start_new_round(self):
         # Récupérer le round actuel avec les infos joueur
         round_info = await self.round_manager.get_current_round_with_player()
 
@@ -618,7 +668,7 @@ class GameConsumer(AsyncWebsocketConsumer):
         await self.channel_layer.group_send(
             self.room_group_name,
             {
-                "type": "turn_end",
+                "type": "new_round",
                 "nextPlayer": next_player,
                 "wordChoices": new_words,
                 "players": updated_players,
