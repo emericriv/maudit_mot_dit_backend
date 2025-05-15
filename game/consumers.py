@@ -287,30 +287,11 @@ class GameConsumer(AsyncWebsocketConsumer):
                 await self.update_score(round_info["current_player"]["id"], points)
 
             # Marque le round comme terminé
-            await self.round_manager.complete_round(
-                word_found=True, winner_id=self.player_id
+            await self.send_round_complete(
+                word_found=True,
+                winner={"id": self.player_id, "pseudo": self.pseudo},
+                round_info=round_info,
             )
-
-            # Récupérer les scores mis à jour
-            updated_players = await self.get_room_players()
-
-            # Envoyer le message de fin de round
-            await self.channel_layer.group_send(
-                self.room_group_name,
-                {
-                    "type": "round_complete",
-                    "winner": {"id": self.player_id, "pseudo": self.pseudo},
-                    "cluesCount": clues_used,
-                    "requiredClues": round_info["required_clues"],
-                    "word": round_info["word"],
-                    "currentPlayer": round_info["current_player"],
-                    "perfect": perfect_guess,
-                    "players": updated_players,
-                },
-            )
-
-            # Arrêter le timer
-            await self.timer_manager.cancel_timer()
 
         else:
             # Vérifie si tous les joueurs ont deviné
@@ -323,33 +304,9 @@ class GameConsumer(AsyncWebsocketConsumer):
 
             if len(guessing_players) >= len(non_current_players):
                 if len(round_info["given_clues"]) >= round_info["required_clues"]:
-                    # Récupérer les informations nécessaires
-                    round_info = (
-                        await self.round_manager.get_current_round_with_player()
+                    await self.send_round_complete(
+                        word_found=False, round_info=round_info
                     )
-
-                    # Marquer le round comme terminé
-                    await self.round_manager.complete_round(word_found=False)
-
-                    # Récupérer les scores mis à jour
-                    updated_players = await self.get_room_players()
-
-                    # Informer tous les joueurs que le round est terminé sans gagnant
-                    await self.channel_layer.group_send(
-                        self.room_group_name,
-                        {
-                            "type": "round_complete",
-                            "winner": None,
-                            "word": round_info["word"],
-                            "cluesCount": len(round_info["given_clues"]),
-                            "requiredClues": round_info["required_clues"],
-                            "currentPlayer": round_info["current_player"],
-                            "perfect": False,
-                            "players": updated_players,
-                        },
-                    )
-
-                    await self.timer_manager.cancel_timer()
                 else:
                     await self.round_manager.update_phase("clue")
                     await self.switch_timer(
@@ -391,31 +348,8 @@ class GameConsumer(AsyncWebsocketConsumer):
             await self.start_new_round()
         elif phase == "guess":
             if len(round.given_clues) >= round.required_clues:
-                # Récupérer les informations nécessaires
                 round_info = await self.round_manager.get_current_round_with_player()
-
-                # Marquer le round comme terminé
-                await self.round_manager.complete_round(word_found=False)
-
-                # Récupérer les scores mis à jour
-                updated_players = await self.get_room_players()
-
-                # Informer tous les joueurs que le round est terminé sans gagnant
-                await self.channel_layer.group_send(
-                    self.room_group_name,
-                    {
-                        "type": "round_complete",
-                        "winner": None,
-                        "word": round_info["word"],
-                        "cluesCount": len(round_info["given_clues"]),
-                        "requiredClues": round_info["required_clues"],
-                        "currentPlayer": round_info["current_player"],
-                        "perfect": False,
-                        "players": updated_players,
-                    },
-                )
-
-                await self.timer_manager.cancel_timer()
+                await self.send_round_complete(word_found=False, round_info=round_info)
             else:
                 await self.round_manager.update_phase("clue")
                 await self.switch_timer(60, "clue", round.current_player.id)
@@ -674,3 +608,41 @@ class GameConsumer(AsyncWebsocketConsumer):
                 "players": updated_players,
             },
         )
+
+        # Démarrer le nouveau timer pour la phase de choix
+        await self.switch_timer(30, "choice", next_player)
+
+    async def send_round_complete(self, word_found=False, winner=None, round_info=None):
+        """Méthode utilitaire pour envoyer un message de fin de round"""
+        if not round_info:
+            round_info = await self.round_manager.get_current_round_with_player()
+
+        # Marquer le round comme terminé
+        await self.round_manager.complete_round(
+            word_found=word_found, winner_id=winner.get("id") if winner else None
+        )
+
+        # Récupérer les scores mis à jour
+        updated_players = await self.get_room_players()
+
+        perfect = (
+            True
+            if winner and len(round_info["given_clues"]) == round_info["required_clues"]
+            else False
+        )
+
+        # Construction du message de base
+        message = {
+            "type": "round_complete",
+            "winner": winner,
+            "word": round_info["word"],
+            "cluesCount": len(round_info["given_clues"]),
+            "requiredClues": round_info["required_clues"],
+            "currentPlayer": round_info["current_player"],
+            "perfect": perfect,
+            "players": updated_players,
+        }
+
+        # Envoyer le message
+        await self.channel_layer.group_send(self.room_group_name, message)
+        await self.timer_manager.cancel_timer()
