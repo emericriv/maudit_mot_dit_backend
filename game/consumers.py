@@ -7,6 +7,7 @@ from django.apps import apps
 
 from .round_manager import RoundManager
 from .timer_manager import RoomTimerManager
+from .word_list import WORDS
 
 
 class GameConsumer(AsyncWebsocketConsumer):
@@ -446,9 +447,20 @@ class GameConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def generate_word_choices(self):
+        # Sélectionner deux mots différents au hasard
+        word1, word2 = random.sample(WORDS, 2)
+
+        # Générer deux nombres d'indices différents entre 1 et 5
+        indices_possibles = list(range(1, 6))
+        nb_indices1 = random.choice(indices_possibles)
+        indices_possibles.remove(nb_indices1)
+        nb_indices2 = random.choice(indices_possibles)
+        while nb_indices2 == nb_indices1:
+            nb_indices2 = random.choice(indices_possibles)
+
         return {
-            "word1": {"word": "pomme", "clues": 3},
-            "word2": {"word": "soleil", "clues": 4},
+            "word1": {"word": word1, "clues": nb_indices1},
+            "word2": {"word": word2, "clues": nb_indices2},
         }
 
     @database_sync_to_async
