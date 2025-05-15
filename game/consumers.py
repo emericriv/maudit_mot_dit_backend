@@ -447,8 +447,8 @@ class GameConsumer(AsyncWebsocketConsumer):
     @database_sync_to_async
     def generate_word_choices(self):
         return {
-            "word1": {"word": "exemple1", "clues": 3},
-            "word2": {"word": "exemple2", "clues": 4},
+            "word1": {"word": "pomme", "clues": 3},
+            "word2": {"word": "soleil", "clues": 4},
         }
 
     @database_sync_to_async
