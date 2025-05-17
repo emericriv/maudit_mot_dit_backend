@@ -89,10 +89,6 @@ class GameConsumer(AsyncWebsocketConsumer):
             await self.handle_make_guess(data)
         elif msg_type == "join_game":
             await self.handle_join_game()
-        elif msg_type == "timer_end":
-            phase = data.get("phase")
-            if phase:
-                await self.handle_timer_end(phase)
         elif msg_type == "start_new_round":
             await self.start_new_round()
 
@@ -230,7 +226,6 @@ class GameConsumer(AsyncWebsocketConsumer):
 
         # Ajoute l'indice et met à jour la phase
         await self.round_manager.add_clue(clue)
-        await self.round_manager.update_phase("guess")
 
         # Informe les joueurs
         await self.channel_layer.group_send(
@@ -308,7 +303,6 @@ class GameConsumer(AsyncWebsocketConsumer):
                         word_found=False, round_info=round_info
                     )
                 else:
-                    await self.round_manager.update_phase("clue")
                     await self.switch_timer(
                         60, "clue", round_info["current_player"]["id"]
                     )
@@ -335,24 +329,6 @@ class GameConsumer(AsyncWebsocketConsumer):
                     }
                 )
             )
-
-    async def handle_timer_end(self, phase):
-        round = await self.round_manager.get_current_round()
-
-        if phase == "choice":
-            # Le joueur n'a pas choisi de mot
-            await self.start_new_round()
-        elif phase == "clue":
-            # Le joueur n'a pas donné d'indice
-            await self.update_score(round.current_player.id, -round.required_clues)
-            await self.start_new_round()
-        elif phase == "guess":
-            if len(round.given_clues) >= round.required_clues:
-                round_info = await self.round_manager.get_current_round_with_player()
-                await self.send_round_complete(word_found=False, round_info=round_info)
-            else:
-                await self.round_manager.update_phase("clue")
-                await self.switch_timer(60, "clue", round.current_player.id)
 
     # --- Méthodes d'accès à la base de données ---
     @database_sync_to_async
@@ -544,10 +520,32 @@ class GameConsumer(AsyncWebsocketConsumer):
         )
 
     async def timer_end(self, event):
-        """Gestionnaire pour l'événement timer_end"""
-        await self.send(
-            text_data=json.dumps({"type": "timer_end", "phase": event["phase"]})
-        )
+        """
+        Annule le timer existant et en démarre un nouveau.
+        """
+        round_info = await self.round_manager.get_current_round_with_player()
+        if not round_info:
+            return
+
+        current_phase = round_info["phase"]
+        print("Timer end")
+
+        if current_phase == "choice":
+            # Le joueur n'a pas choisi de mot
+            await self.start_new_round()
+        elif current_phase == "clue":
+            # Le joueur n'a pas donné d'indice
+            await self.update_score(
+                round_info["current_player"]["id"], -round_info["required_clues"]
+            )
+            await self.send_round_complete(word_found=False, round_info=round_info)
+        elif current_phase == "guess":
+            if len(round_info["given_clues"]) >= round_info["required_clues"]:
+                # Tous les indices ont été donnés, fin du round
+                await self.send_round_complete(word_found=False, round_info=round_info)
+            else:
+                # Retour à la phase d'indices
+                await self.switch_timer(60, "clue", round_info["current_player"]["id"])
 
     async def new_round(self, event):
         """Gestionnaire pour l'événement new_round"""
@@ -568,6 +566,13 @@ class GameConsumer(AsyncWebsocketConsumer):
 
     # === Méthodes utilitaires ===
     async def switch_timer(self, duration, phase, current_player):
+        """
+        Annule le timer existant et en démarre un nouveau.
+        """
+        await self.timer_manager.cancel_timer()
+        await self.round_manager.update_phase(phase)
+        round = await self.round_manager.get_current_round()
+        print(round.phase)
         await self.timer_manager.switch_timer(duration, phase, current_player)
 
     async def start_new_round(self):
