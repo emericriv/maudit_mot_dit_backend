@@ -4,6 +4,7 @@ from channels.layers import get_channel_layer
 
 class RoomTimerManager:
     _instances = {}
+    _active_consumers = {}  # Pour stocker le consumer actif par room
 
     @classmethod
     def get_instance(cls, room_code):
@@ -16,6 +17,10 @@ class RoomTimerManager:
         self.room_group_name = f"game_{room_code}"
         self.timer_task = None
         self.current_timer_id = 0
+
+    def set_active_consumer(self, consumer):
+        """Définit le consumer actif pour cette room"""
+        self._active_consumers[self.room_code] = consumer
 
     async def switch_timer(self, duration, phase, current_player):
         self.current_timer_id += 1
@@ -50,15 +55,12 @@ class RoomTimerManager:
                     },
                 )
 
-            # Timer terminé
-            await channel_layer.group_send(
-                self.room_group_name,
-                {
-                    "type": "timer_end",
-                    "phase": phase,
-                    "currentPlayer": current_player,
-                },
-            )
+            # Timer terminé - appeler directement la méthode du consumer actif
+            active_consumer = self._active_consumers.get(self.room_code)
+            if active_consumer:
+                await active_consumer.timer_end(
+                    {"phase": phase, "currentPlayer": current_player}
+                )
         except asyncio.CancelledError:
             print(f"Timer {timer_id} cancelled")
             return

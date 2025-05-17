@@ -28,6 +28,10 @@ class GameConsumer(AsyncWebsocketConsumer):
             await self.close()
             return
 
+        # Définir ce consumer comme actif seulement s'il est le premier à se connecter
+        if self.room_code not in RoomTimerManager._active_consumers:
+            self.timer_manager.set_active_consumer(self)
+
         await self.channel_layer.group_add(self.room_group_name, self.channel_name)
         await self.accept()
 
