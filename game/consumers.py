@@ -210,6 +210,18 @@ class GameConsumer(AsyncWebsocketConsumer):
 
         round = await self.round_manager.get_current_round()
 
+        # Vérifier si le clue est le mot à deviner
+        if clue.lower() == round.word.lower():
+            await self.send(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": "Vous ne pouvez pas donner votre mot comme indice",
+                    }
+                )
+            )
+            return
+
         # Vérifie si le clue n'a pas déjà été utilisé comme indice ou comme guess
         if clue.lower() in [c.lower() for c in round.given_clues]:
             await self.send(
@@ -406,7 +418,10 @@ class GameConsumer(AsyncWebsocketConsumer):
     def update_score(self, player_id, points):
         Player = apps.get_model("game", "Player")
         player = Player.objects.get(id=player_id)
-        player.score = (player.score or 0) + points
+        score = (player.score or 0) + points
+        if score < 0:
+            score = 0
+        player.score = score
         player.save()
 
     @database_sync_to_async
@@ -542,7 +557,9 @@ class GameConsumer(AsyncWebsocketConsumer):
             await self.update_score(
                 round_info["current_player"]["id"], -round_info["required_clues"]
             )
-            await self.send_round_complete(word_found=False, round_info=round_info)
+            await self.send_round_complete(
+                word_found=False, round_info=round_info, clue_missing=True
+            )
         elif current_phase == "guess":
             if len(round_info["given_clues"]) >= round_info["required_clues"]:
                 # Tous les indices ont été donnés, fin du round
@@ -621,7 +638,9 @@ class GameConsumer(AsyncWebsocketConsumer):
         # Démarrer le nouveau timer pour la phase de choix
         await self.switch_timer(30, "choice", next_player)
 
-    async def send_round_complete(self, word_found=False, winner=None, round_info=None):
+    async def send_round_complete(
+        self, word_found=False, winner=None, round_info=None, clue_missing=False
+    ):
         """Méthode utilitaire pour envoyer un message de fin de round"""
         if not round_info:
             round_info = await self.round_manager.get_current_round_with_player()
@@ -644,6 +663,7 @@ class GameConsumer(AsyncWebsocketConsumer):
         message = {
             "type": "round_complete",
             "winner": winner,
+            "clueMissing": clue_missing,
             "word": round_info["word"],
             "cluesCount": len(round_info["given_clues"]),
             "requiredClues": round_info["required_clues"],
