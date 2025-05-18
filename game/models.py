@@ -43,6 +43,8 @@ class GameRoom(models.Model):
     current_round = models.ForeignKey(
         "Round", null=True, on_delete=models.SET_NULL, related_name="+"
     )
+    total_rounds = models.IntegerField(default=2)  # Nombre total de tours
+    completed_rounds = models.IntegerField(default=0)  # Tours complétés
 
     def __str__(self):
         return f"Room {self.code}"

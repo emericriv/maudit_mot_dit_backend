@@ -84,7 +84,7 @@ class GameConsumer(AsyncWebsocketConsumer):
         elif msg_type == "message" and self.pseudo:
             await self.handle_message(data)
         elif msg_type == "start_game":
-            await self.handle_start_game()
+            await self.handle_start_game(data)
         elif msg_type == "word_choice":
             await self.handle_word_choice(data)
         elif msg_type == "give_clue":
@@ -151,11 +151,21 @@ class GameConsumer(AsyncWebsocketConsumer):
                 },
             )
 
-    async def handle_start_game(self):
+    async def handle_start_game(self, data):
         if not hasattr(self, "player_id") or not await self.is_room_owner():
             return
 
+        await self.reset_game_state()
+
+        # Récupérer la room et les joueurs
+        room = await self.get_room()
         players = await self.get_room_players()
+
+        total_rounds = data.get("totalRounds", 2)
+        room.total_rounds = total_rounds
+        room.completed_rounds = 0
+        await database_sync_to_async(room.save)()
+
         first_player = random.choice(players)["id"]
         words = await self.generate_word_choices()
 
@@ -172,6 +182,7 @@ class GameConsumer(AsyncWebsocketConsumer):
                 "currentPlayer": first_player,
                 "wordChoices": words,
                 "timeLeft": 30,
+                "players": players,
             },
         )
 
@@ -325,6 +336,7 @@ class GameConsumer(AsyncWebsocketConsumer):
 
     async def handle_join_game(self):
         round_data = await self.round_manager.get_current_round_with_player()
+        room = await self.get_room()
 
         if round_data:
             # Récupère les choix de mots actuels
@@ -337,11 +349,13 @@ class GameConsumer(AsyncWebsocketConsumer):
                         "type": "game_started",
                         "currentPlayer": round_data["current_player"]["id"],
                         "wordChoices": word_choices,
-                        "timeLeft": 30,  # ou récupérer depuis le timer manager
+                        "timeLeft": 30,
                         "phase": round_data["phase"],
                         "givenClues": round_data["given_clues"],
                         "guesses": round_data["given_guesses"],
                         "requiredClues": round_data["required_clues"],
+                        "currentRound": room.completed_rounds,
+                        "totalRounds": room.total_rounds,
                     }
                 )
             )
@@ -467,6 +481,27 @@ class GameConsumer(AsyncWebsocketConsumer):
         except GameRoom.DoesNotExist:
             return None
 
+    @database_sync_to_async
+    def reset_game_state(self):
+        GameRoom = apps.get_model("game", "GameRoom")
+        Player = apps.get_model("game", "Player")
+
+        # Récupérer la room de manière synchrone
+        room = GameRoom.objects.get(code=self.room_code)
+
+        # Reset les scores des joueurs d'abord
+        Player.objects.filter(room=room).update(score=0)
+
+        # Supprimer tous les rounds
+        room.rounds.all().delete()
+
+        # Reset la room ensuite
+        room.current_word_choices = None
+        room.current_turn = 0
+        room.current_round = None
+        room.completed_rounds = 0
+        room.save()
+
     # --- Gestionnaires d'événements ---
     async def game_message(self, event):
         await self.send(
@@ -501,6 +536,7 @@ class GameConsumer(AsyncWebsocketConsumer):
         )
 
     async def start_game(self, event):
+        room = await self.get_room()
         await self.send(
             text_data=json.dumps(
                 {
@@ -508,6 +544,9 @@ class GameConsumer(AsyncWebsocketConsumer):
                     "currentPlayer": event["currentPlayer"],
                     "wordChoices": event["wordChoices"],
                     "timeLeft": event["timeLeft"],
+                    "currentRound": room.completed_rounds,
+                    "totalRounds": room.total_rounds,
+                    "players": event["players"],
                 }
             )
         )
@@ -577,6 +616,8 @@ class GameConsumer(AsyncWebsocketConsumer):
                     "nextPlayer": event["nextPlayer"],
                     "wordChoices": event["wordChoices"],
                     "players": event["players"],
+                    "currentRound": event["currentRound"],
+                    "totalRounds": event["totalRounds"],
                 }
             )
         )
@@ -584,6 +625,17 @@ class GameConsumer(AsyncWebsocketConsumer):
     async def round_complete(self, event):
         """Gestionnaire pour l'événement round_complete"""
         await self.send(text_data=json.dumps(event))
+
+    async def game_end(self, event):
+        """Gestionnaire pour l'événement game_end"""
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "game_end",
+                    "players": event["players"],
+                }
+            )
+        )
 
     # === Méthodes utilitaires ===
     async def switch_timer(self, duration, phase, current_player):
@@ -597,6 +649,20 @@ class GameConsumer(AsyncWebsocketConsumer):
         await self.timer_manager.switch_timer(duration, phase, current_player)
 
     async def start_new_round(self):
+        room = await self.get_room()
+        room.completed_rounds += 1
+        await database_sync_to_async(room.save)()
+
+        number_of_players = len(await self.get_room_players())
+
+        if room.completed_rounds >= room.total_rounds * number_of_players:
+            # Fin de la partie
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {"type": "game_end", "players": await self.get_room_players()},
+            )
+            return
+
         # Récupérer le round actuel avec les infos joueur
         round_info = await self.round_manager.get_current_round_with_player()
 
@@ -624,7 +690,7 @@ class GameConsumer(AsyncWebsocketConsumer):
         # Récupérer les scores mis à jour
         updated_players = await self.get_room_players()
 
-        # Informer tous les joueurs de la fin du tour
+        # Informer tous les joueurs du début du nouveau round
         await self.channel_layer.group_send(
             self.room_group_name,
             {
@@ -632,6 +698,8 @@ class GameConsumer(AsyncWebsocketConsumer):
                 "nextPlayer": next_player,
                 "wordChoices": new_words,
                 "players": updated_players,
+                "currentRound": room.completed_rounds // number_of_players + 1,
+                "totalRounds": room.total_rounds,
             },
         )
 
