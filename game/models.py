@@ -45,6 +45,7 @@ class GameRoom(models.Model):
     )
     total_rounds = models.IntegerField(default=2)  # Nombre total de tours
     completed_rounds = models.IntegerField(default=0)  # Tours complétés
+    player_order = models.JSONField(default=list)
 
     def __str__(self):
         return f"Room {self.code}"

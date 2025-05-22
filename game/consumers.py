@@ -166,12 +166,20 @@ class GameConsumer(AsyncWebsocketConsumer):
         room.completed_rounds = 0
         await database_sync_to_async(room.save)()
 
-        first_player = random.choice(players)["id"]
-        words = await self.generate_word_choices()
+        # Mélanger aléatoirement les joueurs pour définir l'ordre de jeu
+        shuffled_players = players.copy()
+        random.shuffle(shuffled_players)
+        player_order = [player["id"] for player in shuffled_players]
+        await self.round_manager.set_player_order(player_order)
+
+        # Premier joueur = premier joueur de l'ordre mélangé
+        first_player = player_order[0]
 
         # Crée un nouveau round
         await self.round_manager.start_new_round(first_player)
+
         # Stocke les choix de mots dans la room
+        words = await self.generate_word_choices()
         await self.set_current_word_choices(words)
 
         # Informe les joueurs
@@ -183,6 +191,7 @@ class GameConsumer(AsyncWebsocketConsumer):
                 "wordChoices": words,
                 "timeLeft": 30,
                 "players": players,
+                "playerOrder": player_order,
             },
         )
 
@@ -341,6 +350,7 @@ class GameConsumer(AsyncWebsocketConsumer):
         if round_data:
             # Récupère les choix de mots actuels
             word_choices = await self.get_current_word_choices()
+            player_order = await self.round_manager.get_player_order()
 
             # Envoie l'état actuel du jeu au joueur qui rejoint
             await self.send(
@@ -356,6 +366,7 @@ class GameConsumer(AsyncWebsocketConsumer):
                         "requiredClues": round_data["required_clues"],
                         "currentRound": room.completed_rounds,
                         "totalRounds": room.total_rounds,
+                        "playerOrder": player_order,
                     }
                 )
             )
@@ -402,7 +413,6 @@ class GameConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def transfer_ownership(self):
-        Player = apps.get_model("game", "Player")
         GameRoom = apps.get_model("game", "GameRoom")
         try:
             room = GameRoom.objects.get(code=self.room_code)
@@ -547,6 +557,7 @@ class GameConsumer(AsyncWebsocketConsumer):
                     "currentRound": room.completed_rounds,
                     "totalRounds": room.total_rounds,
                     "players": event["players"],
+                    "playerOrder": event.get("playerOrder", []),
                 }
             )
         )
@@ -618,6 +629,7 @@ class GameConsumer(AsyncWebsocketConsumer):
                     "players": event["players"],
                     "currentRound": event["currentRound"],
                     "totalRounds": event["totalRounds"],
+                    "playerOrder": event.get("playerOrder", []),
                 }
             )
         )
@@ -666,17 +678,14 @@ class GameConsumer(AsyncWebsocketConsumer):
         # Récupérer le round actuel avec les infos joueur
         round_info = await self.round_manager.get_current_round_with_player()
 
-        # Choisir le prochain joueur
-        players = await self.get_room_players()
-        current_player_index = next(
-            (
-                i
-                for i, p in enumerate(players)
-                if p["id"] == round_info["current_player"]["id"]
-            ),
-            0,
-        )
-        next_player = players[(current_player_index + 1) % len(players)]["id"]
+        # Récupérer l'ordre des joueurs
+        player_order = await self.round_manager.get_player_order()
+
+        # Trouver l'index du joueur actuel dans l'ordre
+        current_player_index = player_order.index(round_info["current_player"]["id"])
+
+        # Déterminer le prochain joueur dans l'ordre
+        next_player = player_order[(current_player_index + 1) % len(player_order)]
 
         # Générer de nouveaux mots pour le prochain tour
         new_words = await self.generate_word_choices()
@@ -700,6 +709,7 @@ class GameConsumer(AsyncWebsocketConsumer):
                 "players": updated_players,
                 "currentRound": room.completed_rounds // number_of_players + 1,
                 "totalRounds": room.total_rounds,
+                "playerOrder": player_order,
             },
         )
 

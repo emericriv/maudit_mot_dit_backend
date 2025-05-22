@@ -127,3 +127,19 @@ class RoundManager:
             return None
         except GameRoom.DoesNotExist:
             return None
+
+    @database_sync_to_async
+    def set_player_order(self, player_order):
+        """Définit l'ordre dans lequel les joueurs vont jouer"""
+        GameRoom = apps.get_model("game", "GameRoom")
+        room = GameRoom.objects.get(code=self.room_code)
+        room.player_order = player_order
+        room.save()
+        return room
+
+    @database_sync_to_async
+    def get_player_order(self):
+        """Récupère l'ordre des joueurs"""
+        GameRoom = apps.get_model("game", "GameRoom")
+        room = GameRoom.objects.get(code=self.room_code)
+        return room.player_order
