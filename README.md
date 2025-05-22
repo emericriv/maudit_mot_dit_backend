@@ -23,9 +23,9 @@ Ce backend repose sur **Django**, **Django REST Framework** et **Django Channels
 
 1. Crée un fichier `.env` si besoin (selon ton usage)
 2. Ajoute les clés nécessaires dans `core/settings.py`
-3. Installe et lance **Redis** (nécessaire pour les WebSockets) :
+3. Installe et lance **Redis** (nécessaire pour les WebSockets), pour ma part, j'utilise WSL sous Windows et je lance la commande :
    ```bash
-   redis-server
+   sudo service redis-server start
    ```
 
 ---
@@ -33,6 +33,7 @@ Ce backend repose sur **Django**, **Django REST Framework** et **Django Channels
 ## 🚀 Lancement
 
 ### Serveur ASGI avec Daphne (requis pour Channels) :
+
 ```bash
 daphne -p 8000 core.asgi:application
 ```
