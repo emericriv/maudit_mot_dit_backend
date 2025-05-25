@@ -1,6 +1,6 @@
 # 🎮 Maudit Mot Dit - Backend
 
-Ce backend repose sur **Django**, **Django REST Framework** et **Django Channels** avec WebSockets pour la communication en temps réel.
+Ce backend repose sur **Django**, **Django REST Framework** et **Django Channels** avec WebSockets pour la communication en temps réel. C'est lui qui s'occupe de toute la gestion du jeu.
 
 ---
 
