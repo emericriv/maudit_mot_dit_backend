@@ -35,7 +35,7 @@ Ce backend repose sur **Django**, **Django REST Framework** et **Django Channels
 ### Serveur ASGI avec Daphne (requis pour Channels) :
 
 ```bash
-daphne -p 8000 core.asgi:application
+daphne -p 8000 asgi:application
 ```
 
 ---
