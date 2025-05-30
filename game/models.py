@@ -17,6 +17,7 @@ class Round(models.Model):
     phase = models.CharField(max_length=10, choices=PHASE_CHOICES, default="choice")
     word = models.CharField(max_length=100, blank=True)
     required_clues = models.IntegerField(null=True)
+    can_malus = models.BooleanField(default=False)  # Indique si le joueur peut malusser
     given_clues = models.JSONField(default=list)  # Liste des indices donnés
     given_guesses = models.JSONField(
         default=list

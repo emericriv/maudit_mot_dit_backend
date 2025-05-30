@@ -95,6 +95,8 @@ class GameConsumer(AsyncWebsocketConsumer):
             await self.handle_join_game()
         elif msg_type == "start_new_round":
             await self.start_new_round()
+        elif msg_type == "apply-malus":
+            await self.apply_malus(data)
 
     # --- Méthodes de traitement des messages ---
     async def handle_init(self, data):
@@ -208,7 +210,10 @@ class GameConsumer(AsyncWebsocketConsumer):
 
         # Met à jour le round avec le mot choisi
         await self.round_manager.update_phase(
-            "clue", word=word, required_clues=word_choice["clues"]
+            "clue",
+            word=word,
+            required_clues=word_choice["clues"],
+            can_malus=word_choice["malus"],
         )
 
         # Informe les joueurs
@@ -371,6 +376,63 @@ class GameConsumer(AsyncWebsocketConsumer):
                 )
             )
 
+    async def apply_malus(self, data):
+        target_player_pseudo = data.get("targetPlayerPseudo")
+        if not target_player_pseudo:
+            await self.send(
+                text_data=json.dumps(
+                    {"type": "error", "message": "Pseudo cible manquant"}
+                )
+            )
+            return
+
+        round_info = await self.round_manager.get_current_round_with_player()
+        if not round_info or not round_info["can_malus"]:
+            await self.send(
+                text_data=json.dumps(
+                    {"type": "error", "message": "Malus non applicable"}
+                )
+            )
+            return
+
+        # Récupération du pseudo du joueur cible via son pseudo
+        old_players = await self.get_room_players()
+        target_player = next(
+            (p for p in old_players if p["pseudo"] == target_player_pseudo), None
+        )
+        if not target_player:
+            await self.send(
+                text_data=json.dumps(
+                    {"type": "error", "message": "Joueur cible introuvable"}
+                )
+            )
+            return
+
+        # Applique le malus si le joueur cible n'est pas à 0
+        if target_player["score"] <= 0:
+            await self.send(
+                text_data=json.dumps(
+                    {"type": "error", "message": "Le joueur cible est déjà à 0 points"}
+                )
+            )
+            return
+
+        await self.update_score(target_player["id"], -1)
+
+        # Récupère les joueurs mis à jour
+        updated_players = await self.get_room_players()
+
+        # Informe les joueurs
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                "type": "round_complete",
+                "malusApplied": True,
+                "message": f"{self.pseudo} a appliqué un malus à {target_player_pseudo}",
+                "players": updated_players,
+            },
+        )
+
     # --- Méthodes d'accès à la base de données ---
     @database_sync_to_async
     def get_room(self):
@@ -461,9 +523,24 @@ class GameConsumer(AsyncWebsocketConsumer):
         while nb_indices2 == nb_indices1:
             nb_indices2 = random.choice(indices_possibles)
 
+        # Tirage d'un malus qui permettra au joueur d'infliger -1 point à un autre joueur, 20% de chance séparé entre les deux mots
+        malus_rate = random.random()
+        malus_word1 = False
+        malus_word2 = False
+        if malus_rate < 0.1:
+            malus_word1 = True
+        elif malus_rate > 0.9:
+            malus_word2 = True
+
+        # DEBUG
+        # if malus_rate1 < 0.5:
+        #     malus_word1 = True
+        # else:
+        #     malus_word2 = True
+
         return {
-            "word1": {"word": word1, "clues": nb_indices1},
-            "word2": {"word": word2, "clues": nb_indices2},
+            "word1": {"word": word1, "clues": nb_indices1, "malus": malus_word1},
+            "word2": {"word": word2, "clues": nb_indices2, "malus": malus_word2},
         }
 
     @database_sync_to_async
@@ -746,6 +823,7 @@ class GameConsumer(AsyncWebsocketConsumer):
             "cluesCount": len(round_info["given_clues"]),
             "requiredClues": round_info["required_clues"],
             "currentPlayer": round_info["current_player"],
+            "canMalus": round_info["can_malus"],
             "perfect": perfect,
             "players": updated_players,
         }

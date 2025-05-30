@@ -118,6 +118,7 @@ class RoundManager:
                     "required_clues": round.required_clues,
                     "given_clues": round.given_clues,
                     "given_guesses": round.given_guesses,
+                    "can_malus": round.can_malus,
                     "guessing_players": round.guessing_players,
                     "current_player": {
                         "id": str(round.current_player.id),
