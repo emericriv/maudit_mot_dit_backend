@@ -1,6 +1,8 @@
 import json
 from math import e
+from pydoc import text
 import random
+import asyncio
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 from django.apps import apps
@@ -8,6 +10,8 @@ from django.apps import apps
 from .round_manager import RoundManager
 from .timer_manager import RoomTimerManager
 from .word_list import WORDS
+
+DISCONNECT_TIMEOUTS = {}
 
 
 class GameConsumer(AsyncWebsocketConsumer):
@@ -40,36 +44,51 @@ class GameConsumer(AsyncWebsocketConsumer):
 
     async def disconnect(self, close_code):
         if hasattr(self, "pseudo"):
-            player = await self.get_player(self.session_id)
-            was_owner = player and player.is_owner
+            # On ne supprime pas tout de suite, on attend un délai
+            loop = asyncio.get_event_loop()
+            session_id = getattr(self, "session_id", None)
+            player_id = getattr(self, "player_id", None)
+            pseudo = getattr(self, "pseudo", None)
+            room_code = self.room_code
 
-            await self.channel_layer.group_send(
-                self.room_group_name,
-                {
-                    "type": "player_left",
-                    "player": {
-                        "id": self.player_id,
-                        "pseudo": self.pseudo,
-                    },
-                },
-            )
+            async def delayed_remove():
+                await asyncio.sleep(30)  # délai de grâce (30 secondes)
+                # Vérifie si le joueur ne s'est pas reconnecté
+                if DISCONNECT_TIMEOUTS.get(session_id) == remove_task:
+                    player = await self.get_player(session_id)
+                    was_owner = player and player.is_owner
 
-            if was_owner:
-                new_owner = await self.transfer_ownership()
-                if new_owner:
                     await self.channel_layer.group_send(
                         self.room_group_name,
                         {
-                            "type": "owner_changed",
+                            "type": "player_left",
                             "player": {
-                                "id": str(new_owner.id),
-                                "pseudo": new_owner.pseudo,
-                                "is_owner": True,
+                                "id": player_id,
+                                "pseudo": pseudo,
                             },
                         },
                     )
 
-            await self.remove_player()
+                    if was_owner:
+                        new_owner = await self.transfer_ownership()
+                        if new_owner:
+                            await self.channel_layer.group_send(
+                                self.room_group_name,
+                                {
+                                    "type": "owner_changed",
+                                    "player": {
+                                        "id": str(new_owner.id),
+                                        "pseudo": new_owner.pseudo,
+                                        "is_owner": True,
+                                    },
+                                },
+                            )
+
+                    await self.remove_player()
+                    DISCONNECT_TIMEOUTS.pop(session_id, None)
+
+            remove_task = loop.create_task(delayed_remove())
+            DISCONNECT_TIMEOUTS[session_id] = remove_task
 
         await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
 
@@ -97,6 +116,8 @@ class GameConsumer(AsyncWebsocketConsumer):
             await self.start_new_round()
         elif msg_type == "apply-malus":
             await self.apply_malus(data)
+        elif msg_type == "leave_room":
+            await self.handle_leave_room()
 
     # --- Méthodes de traitement des messages ---
     async def handle_init(self, data):
@@ -118,6 +139,11 @@ class GameConsumer(AsyncWebsocketConsumer):
         self.player_id = str(player.id)
         self.pseudo = player.pseudo
         self.session_id = str(player.session_id)
+
+        # Si le joueur était en attente de suppression, on annule la suppression
+        remove_task = DISCONNECT_TIMEOUTS.pop(session_id, None)
+        if remove_task:
+            remove_task.cancel()
 
         await self.send(
             json.dumps(
@@ -357,24 +383,26 @@ class GameConsumer(AsyncWebsocketConsumer):
             word_choices = await self.get_current_word_choices()
             player_order = await self.round_manager.get_player_order()
 
-            # Envoie l'état actuel du jeu au joueur qui rejoint
-            await self.send(
-                text_data=json.dumps(
-                    {
-                        "type": "game_started",
-                        "currentPlayer": round_data["current_player"]["id"],
-                        "wordChoices": word_choices,
-                        "timeLeft": 30,
-                        "phase": round_data["phase"],
-                        "givenClues": round_data["given_clues"],
-                        "guesses": round_data["given_guesses"],
-                        "requiredClues": round_data["required_clues"],
-                        "currentRound": room.completed_rounds,
-                        "totalRounds": room.total_rounds,
-                        "playerOrder": player_order,
-                    }
-                )
+            text_data = json.dumps(
+                {
+                    "type": "game_started",
+                    "currentPlayer": round_data["current_player"]["id"],
+                    "wordChoices": word_choices,
+                    "timeLeft": 30,
+                    "phase": round_data["phase"],
+                    "givenClues": round_data["given_clues"],
+                    "guesses": round_data["given_guesses"],
+                    "requiredClues": round_data["required_clues"],
+                    "currentRound": room.completed_rounds,
+                    "totalRounds": room.total_rounds,
+                    "playerOrder": player_order,
+                }
             )
+
+            print(f"Sending game state to {self.pseudo}: {text_data}")
+
+            # Envoie l'état actuel du jeu au joueur qui rejoint
+            await self.send(text_data=text_data)
 
     async def apply_malus(self, data):
         target_player_pseudo = data.get("targetPlayerPseudo")
@@ -432,6 +460,49 @@ class GameConsumer(AsyncWebsocketConsumer):
                 "players": updated_players,
             },
         )
+
+    async def handle_leave_room(self):
+        # Suppression immédiate, sans délai
+        session_id = getattr(self, "session_id", None)
+        player_id = getattr(self, "player_id", None)
+        pseudo = getattr(self, "pseudo", None)
+
+        if session_id:
+            remove_task = DISCONNECT_TIMEOUTS.pop(session_id, None)
+            if remove_task:
+                remove_task.cancel()
+
+        player = await self.get_player(session_id)
+        was_owner = player and player.is_owner
+
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                "type": "player_left",
+                "player": {
+                    "id": player_id,
+                    "pseudo": pseudo,
+                },
+            },
+        )
+
+        if was_owner:
+            new_owner = await self.transfer_ownership()
+            if new_owner:
+                await self.channel_layer.group_send(
+                    self.room_group_name,
+                    {
+                        "type": "owner_changed",
+                        "player": {
+                            "id": str(new_owner.id),
+                            "pseudo": new_owner.pseudo,
+                            "is_owner": True,
+                        },
+                    },
+                )
+
+        await self.remove_player()
+        await self.close()
 
     # --- Méthodes d'accès à la base de données ---
     @database_sync_to_async
@@ -531,12 +602,6 @@ class GameConsumer(AsyncWebsocketConsumer):
             malus_word1 = True
         elif malus_rate > 0.9:
             malus_word2 = True
-
-        # DEBUG
-        # if malus_rate1 < 0.5:
-        #     malus_word1 = True
-        # else:
-        #     malus_word2 = True
 
         return {
             "word1": {"word": word1, "clues": nb_indices1, "malus": malus_word1},
